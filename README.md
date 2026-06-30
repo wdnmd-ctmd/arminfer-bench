@@ -37,11 +37,11 @@ Arm64 从零复跑,本轮有两条路径:
 
 ## Naive baseline 说明
 
-`naive` 为 **armv8-a 基础基线**,构建参数为 `-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a -DGGML_CPU_KLEIDIAI=OFF`,并按 T1.6 核对结果关闭 llama.cpp 自带的 ARM 在线重排(repack)。
+`naive` 为 **armv8-a 基础基线**,构建参数为 `-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a -DGGML_CPU_KLEIDIAI=OFF -DGGML_CPU_REPACK=OFF`。
 
 诚实标注:**naive 仍含 NEON,无法完全关闭**。naive 的目标是「尽可能未优化的 armv8-a NEON 基础基线」,而非「零 SIMD 纯标量」。所谓"未优化"指不开 i8mm、不开 KleidiAI 微内核、关闭 ARM 重排;NEON 本身是 armv8-a ABI 的一部分,编译器与 llama.cpp 默认即会产出 NEON 指令,不具备干净的 build-time 关闭开关。
 
-`repack`(ARM 重排)的真实关闭机制在 T1.6 于 pinned commit 上核对后写入 `AGENTS.md`。
+`repack`(ARM 重排)的关闭机制已在 T1.6 于 pinned commit `fabde3b`(release b9728)上核对:由 cmake option `GGML_CPU_REPACK`(默认 ON)控制,`-DGGML_CPU_REPACK=OFF` 即可关闭运行时 Q4_0→Q4_X_X 重排。详见 `AGENTS.md`「repack 真实关闭机制」。
 
 ## License
 

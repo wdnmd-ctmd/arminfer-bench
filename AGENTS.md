@@ -15,10 +15,11 @@
 ## 目录结构
 
 ```
-/LICENSE                      Apache-2.0 全文(版权行 Copyright 2026 <login>)
+/LICENSE                      Apache-2.0 全文(版权行 Copyright 2026 wdnmd-ctmd)
 /README.md                    三段式:Overview / Functionality / Setup
 /AGENTS.md                    项目目标、目录、Arm64 构建运行验证说明、五档定义
 /.gitignore                   忽略 third_party/llama.cpp 与其 build/ 等
+/.gitattributes               强制 LF 行尾(shell/yml 跨平台)
 /scripts/run_bench.sh         一键:构建→下载模型→基准→输出 JSON  (T4)
 /scripts/build_variant.sh     按档位参数化构建 llama.cpp            (T2)
 /scripts/fetch_llamacpp.sh    浅拉固定 commit 的 llama.cpp 到 third_party/ (T1 本轮)
@@ -47,25 +48,26 @@
 - `-DGGML_NATIVE=OFF`
 - `-DGGML_CPU_ARM_ARCH=armv9-a+dotprod+i8mm+sve2`(KleidiAI cmake 靠字面 `+dotprod` token 选内核,**必须显式补 `+dotprod`**)
 - `-DGGML_CPU_KLEIDIAI=ON/OFF`
+- `-DGGML_CPU_REPACK=ON/OFF`(默认 ON;naive 档 OFF,见下节)
 - 用 `ccache` 跨档共享 llama/ggml 核心目标,编译时间砍半。
 
-> 本轮 T1 naive 档:`-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a -DGGML_CPU_KLEIDIAI=OFF`,并按 T1.6 核对结果关闭 llama.cpp 自带 ARM 重排,作为真·未优化基线。
+> 本轮 T1 naive 档:`-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a -DGGML_CPU_KLEIDIAI=OFF -DGGML_CPU_REPACK=OFF`,作为真·未优化基线。
 
-## repack 真实关闭机制
+## repack 真实关闭机制(T1.6 已核对)
 
-`【T1.6 待核对】`
+**pinned commit**:`fabde3bf5136940eb03821aa2490e2360093965b`(release b9728,2026-06-19)。事实来源见 spec.md「naive 档"关闭自带 repack"」节。
 
-llama.cpp 的在线 repack(ARM 重排)未必有干净的 build-time `-D` 开关。**必须先在 pinned commit 上核对真实关闭机制**后再实现,不要假设有现成 `-D` 开关。候选:
+已在该 commit 上核对:repack 由 cmake option `GGML_CPU_REPACK` 控制(定义于 `ggml/CMakeLists.txt:120`),描述 "ggml: use runtime weight conversion of Q4_0 to Q4_X_X",**默认 ON**。
 
-- cmake flag:`GGML_CPU_AARCH64` / `GGML_CPU_REPACK` 等
-- 运行时环境变量
-- 版本默认行为
-
-核对后回填此处(并在 spec.md 同步)。
+- **关闭方式**:`-DGGML_CPU_REPACK=OFF`(纯 build-time cmake flag,**无运行时 env var 覆盖**)。
+- **源码归属**:`repack.cpp`/`repack.h` 在 `ggml-cpu/` 顶层 + ARM 专属 `ggml-cpu/arch/arm/repack.cpp`;运行时门控 Q4_0→Q4_X_X 在线重排。
+- **naive 档构建参数**:`-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a -DGGML_CPU_KLEIDIAI=OFF -DGGML_CPU_REPACK=OFF`。
+- **诚实标注**:`repack.cpp` 仍被编译进二进制(单档构建 `GGML_CPU_SOURCES` 无条件包含),`GGML_CPU_REPACK=OFF` 时运行时不做重排;naive 仍含 NEON。
+- 候选 `GGML_CPU_AARCH64` **不存在**;运行时 env var / 版本默认行为均非关闭途径。
 
 ## naive 诚实标注
 
-`naive` 为 **armv8-a 基础基线**,构建参数为 `-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a -DGGML_CPU_KLEIDIAI=OFF`。
+`naive` 为 **armv8-a 基础基线**,构建参数为 `-DGGML_NATIVE=OFF -DGGML_CPU_ARM_ARCH=armv8-a -DGGML_CPU_KLEIDIAI=OFF -DGGML_CPU_REPACK=OFF`。
 
 **naive 仍含 NEON,无法完全关闭**。naive 的目标是「尽可能未优化的 armv8-a NEON 基础基线」,而非「零 SIMD 纯标量」。所谓"未优化"指不开 i8mm、不开 KleidiAI 微内核、关闭 ARM 重排;NEON 本身是 armv8-a ABI 的一部分,编译器与 llama.cpp 默认即会产出 NEON 指令,不具备干净的 build-time 关闭开关。
 
