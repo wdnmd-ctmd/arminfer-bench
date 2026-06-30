@@ -1,0 +1,279 @@
+name: Arm64 Bench (naive baseline)
+
+# W1 = T0 + T1. Source of truth: .trae/specs/bootstrap-arm-infer-bench/spec.md
+# This workflow lands the naive smoke baseline on ubuntu-24.04-arm.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/**'
+      - '.github/workflows/**'
+      - 'src/**'
+      - '.gitattributes'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Cancel superseded in-flight runs on the same ref (T1.3).
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned llama.cpp commit (release b9728, 2026-06-19). T1.6 verified repack mechanism here.
+  LLAMA_COMMIT: fabde3bf5136940eb03821aa2490e2360093965b
+  # Pinned GGUF (HuggingFace resolve/<REV>/<file>) + expected sha256 (T1.8).
+  GGUF_REPO: Qwen/Qwen2.5-1.5B-Instruct-GGUF
+  GGUF_REV: 91cad51170dc346986eccefdc2dd33a9da36ead9
+  GGUF_FILE: qwen2.5-1.5b-instruct-q4_k_m.gguf
+  GGUF_SHA256: 6a1a2eb6d15622bf3c96857206351ba97e1af16c30d7a74ee38970e434e9407e
+  # Pinned bench args (NF3).
+  BENCH_THREADS: 4
+  BENCH_PP: 512
+  BENCH_TG: 128
+  BENCH_REPS: 5
+
+jobs:
+  naive-baseline:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4.2.2
+
+      - name: CPU features self-evidence (T1.4)
+        id: cpu
+        run: |
+          echo "::group::CPU info"
+          echo "=== /proc/cpuinfo (CPU part / implementer / Features) ==="
+          grep -E '^(CPU part|CPU implementer|Features)' /proc/cpuinfo | sort -u
+          echo "=== lscpu ==="
+          lscpu
+          FEATURES="$(grep -m1 '^Features' /proc/cpuinfo | cut -d: -f2 | xargs)"
+          CPU_IMPL="$(grep -m1 '^CPU implementer' /proc/cpuinfo | awk '{print $3}')"
+          CPU_PART="$(grep -m1 '^CPU part'     /proc/cpuinfo | awk '{print $3}')"
+          echo "cpu_features=${FEATURES}" >> "$GITHUB_OUTPUT"
+          echo "cpu_impl=${CPU_IMPL}"       >> "$GITHUB_OUTPUT"
+          echo "cpu_part=${CPU_PART}"       >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "Feature presence (asimddp=dotprod, i8mm, sve2):"
+          for f in asimddp i8mm sve2; do
+            if echo "$FEATURES" | grep -qw "$f"; then echo "  $f: PRESENT"; else echo "  $f: absent"; fi
+          done
+          echo "::endgroup::"
+
+      - name: Environment info (compiler / runner_os)
+        id: envinfo
+        run: |
+          COMPILER="$(cc --version | head -1)"
+          RUNNER_OS="$(. /etc/os-release && echo "${PRETTY_NAME}")"
+          echo "compiler=${COMPILER}"   >> "$GITHUB_OUTPUT"
+          echo "runner_os=${RUNNER_OS}" >> "$GITHUB_OUTPUT"
+          {
+            echo "=== compiler ==="; cc --version | head -1
+            echo "=== runner os ==="; cat /etc/os-release
+          } | sed 's/^/  /'
+
+      - name: Install ccache (T1.5)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ccache
+
+      - name: Configure ccache cache (T1.5)
+        uses: actions/cache@v4.2.0
+        with:
+          path: ~/.ccache
+          key: ccache-arm64-naive-${{ env.LLAMA_COMMIT }}-${{ github.sha }}
+          restore-keys: |
+            ccache-arm64-naive-${{ env.LLAMA_COMMIT }}-
+
+      - name: Fetch llama.cpp at pinned commit (T1.1)
+        run: |
+          bash scripts/fetch_llamacpp.sh
+          echo "llama_commit=$(git -C third_party/llama.cpp rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore GGUF cache (T1.8)
+        id: gguf-cache
+        uses: actions/cache@v4.2.0
+        with:
+          path: models/${{ env.GGUF_FILE }}
+          key: gguf-${{ env.GGUF_FILE }}-${{ env.GGUF_REV }}
+
+      - name: Download GGUF + sha256 verify (T1.8)
+        if: steps.gguf-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p models
+          URL="https://huggingface.co/${GGUF_REPO}/resolve/${GGUF_REV}/${GGUF_FILE}"
+          echo "Downloading ${URL}"
+          curl -fL --retry 5 --retry-delay 3 --connect-timeout 30 -o "models/${GGUF_FILE}" "${URL}"
+          ACTUAL="$(sha256sum "models/${GGUF_FILE}" | awk '{print $1}')"
+          echo "expected sha256: ${GGUF_SHA256}"
+          echo "actual   sha256: ${ACTUAL}"
+          if [ "${ACTUAL}" != "${GGUF_SHA256}" ]; then
+            echo "::error::GGUF sha256 mismatch"
+            exit 1
+          fi
+          echo "GGUF verified."
+
+      - name: Build naive variant (T1.7)
+        run: |
+          cmake -S third_party/llama.cpp -B third_party/llama.cpp/build \
+            -DGGML_NATIVE=OFF \
+            -DGGML_CPU_ARM_ARCH=armv8-a \
+            -DGGML_CPU_KLEIDIAI=OFF \
+            -DGGML_CPU_REPACK=OFF \
+            -DGGML_CCACHE=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF
+          cmake --build third_party/llama.cpp/build --target llama-bench -j"$(nproc)"
+          echo "=== llama-bench binary ==="
+          third_party/llama.cpp/build/bin/llama-bench --version || true
+
+      - name: Run llama-bench + capture peak memory (T1.9, T1.10)
+        run: |
+          mkdir -p results
+          BENCH_BIN="third_party/llama.cpp/build/bin/llama-bench"
+          # /usr/bin/time -v wraps llama-bench as the MAIN method for peak RSS (NF3).
+          # stdout (llama-bench -o json) -> bench_raw.json ; stderr (time -v stats) -> time_stderr.txt
+          set +e
+          /usr/bin/time -v "${BENCH_BIN}" \
+            -t "${BENCH_THREADS}" -p "${BENCH_PP}" -n "${BENCH_TG}" -r "${BENCH_REPS}" \
+            -m "models/${GGUF_FILE}" \
+            -o json > bench_raw.json 2> time_stderr.txt
+          RC=$?
+          set -e
+          echo "=== llama-bench raw JSON (stdout) ==="
+          cat bench_raw.json
+          echo ""
+          echo "=== /usr/bin/time -v stats (stderr) ==="
+          cat time_stderr.txt
+          echo ""
+          if [ $RC -ne 0 ]; then
+            echo "::error::llama-bench exited with code ${RC}"
+            exit $RC
+          fi
+
+      - name: Assemble result JSON (T1.11, T1.12, T1.14)
+        run: |
+          python3 - <<'PY'
+          import json, os, re, subprocess, datetime, pathlib, sys
+
+          def sh(cmd):
+              return subprocess.check_output(cmd, shell=True, text=True).strip()
+
+          # --- CPU info (re-derive for self-containment) ---
+          cpuinfo = pathlib.Path('/proc/cpuinfo').read_text()
+          feats = ''
+          impl = part = ''
+          for line in cpuinfo.splitlines():
+              if line.startswith('Features'):
+                  feats = line.split(':',1)[1].strip()
+              elif line.startswith('CPU implementer'):
+                  impl = line.split(':',1)[1].strip().split()[-1]
+              elif line.startswith('CPU part'):
+                  part = line.split(':',1)[1].strip().split()[-1]
+          cpu_model = f"implementer={impl} part={part}"
+
+          # --- compiler / runner_os ---
+          compiler = sh("cc --version | head -1")
+          runner_os = ""
+          try:
+              for line in pathlib.Path('/etc/os-release').read_text().splitlines():
+                  if line.startswith('PRETTY_NAME='):
+                      runner_os = line.split('=',1)[1].strip().strip('"')
+          except Exception:
+              runner_os = "unknown"
+
+          # --- llama commit ---
+          llama_commit = sh("git -C third_party/llama.cpp rev-parse HEAD")
+
+          # --- parse llama-bench JSON ---
+          raw = pathlib.Path('bench_raw.json').read_text().strip()
+          if not raw:
+              print("::error::empty llama-bench output"); sys.exit(1)
+          rows = json.loads(raw)
+          def getf(r, *names):
+              for n in names:
+                  if n in r and r[n] not in (None, ""):
+                      return r[n]
+              return None
+          prefill_avg = prefill_sd = decode_avg = decode_sd = None
+          for r in rows:
+              pa = getf(r, 'pp_avg', 'prompt_avg', 'pp')
+              ta = getf(r, 'tg_avg', 'gen_avg', 'tg')
+              if pa and prefill_avg is None:
+                  prefill_avg = float(pa); prefill_sd = float(getf(r,'pp_stddev','pp_stddev') or 0)
+              if ta and decode_avg is None:
+                  decode_avg = float(ta); decode_sd = float(getf(r,'tg_stddev','tg_stddev') or 0)
+          if prefill_avg is None or decode_avg is None:
+              print("::error::could not parse pp_avg/tg_avg from llama-bench JSON")
+              print("raw rows:", rows); sys.exit(1)
+
+          # --- peak memory from /usr/bin/time -v ---
+          time_stderr = pathlib.Path('time_stderr.txt').read_text()
+          m = re.search(r'Maximum resident set size \(kbytes\)\s*:\s*(\d+)', time_stderr)
+          if not m:
+              print("::error::could not find 'Maximum resident set size' in time -v output"); sys.exit(1)
+          peak_mem_mb = round(int(m.group(1)) / 1024.0, 2)
+          peak_mem_source = "time_v_maxrss"
+
+          # --- TTFT (NF3) ---
+          pp_n = int(os.environ['BENCH_PP'])
+          tg_n = int(os.environ['BENCH_TG'])
+          reps = int(os.environ['BENCH_REPS'])
+          n_threads = int(os.environ['BENCH_THREADS'])
+          ttft_formula = "ttft_ms = pp_n / prefill_tok_s * 1000"
+          ttft_ms = round(pp_n / prefill_avg * 1000.0, 3)
+
+          # --- stddev alert (>10% of avg) ---
+          for name, avg, sd in (("prefill", prefill_avg, prefill_sd), ("decode", decode_avg, decode_sd)):
+              if avg > 0 and sd / avg > 0.10:
+                  print(f"::warning::{name} stddev/avg = {sd/avg*100:.2f}% > 10% threshold")
+
+          # --- model size ---
+          gguf_path = pathlib.Path('models') / os.environ['GGUF_FILE']
+          model_size_mb = round(gguf_path.stat().st_size / (1024*1024), 2)
+
+          ts = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+          result = {
+            "variant": "naive",
+            "quant": "Q4_K_M",
+            "model": "Qwen2.5-1.5B-Instruct",
+            "model_revision": os.environ['GGUF_REV'],
+            "model_sha256": os.environ['GGUF_SHA256'],
+            "model_size_mb": model_size_mb,
+            "bench_args": f"-t {n_threads} -p {pp_n} -n {tg_n} -r {reps}",
+            "pp_n": pp_n, "tg_n": tg_n, "reps": reps,
+            "prefill_tok_s": prefill_avg, "prefill_stddev": prefill_sd,
+            "decode_tok_s": decode_avg, "decode_stddev": decode_sd,
+            "ttft_ms": ttft_ms, "ttft_formula": ttft_formula,
+            "peak_mem_mb": peak_mem_mb, "peak_mem_source": peak_mem_source,
+            "n_threads": n_threads,
+            "cpu_model": cpu_model,
+            "cpu_features": feats,
+            "compiler": compiler,
+            "llama_commit": llama_commit,
+            "runner_os": runner_os,
+            "timestamp": ts,
+          }
+
+          pathlib.Path('results').mkdir(exist_ok=True)
+          out = pathlib.Path('results') / f"{ts}-naive-q4_k_m.json"
+          out.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding='utf-8')
+          print("=== RESULT JSON (baseline, for director review) ===")
+          print(out.read_text(encoding='utf-8'))
+          print(f"=== written to {out} ===")
+          PY
+
+      - name: Upload artifacts (T1.13)
+        if: always()
+        uses: actions/upload-artifact@v4.4.3
+        with:
+          name: naive-baseline-${{ github.run_id }}
+          path: |
+            results/*.json
+            bench_raw.json
+            time_stderr.txt
+          if-no-files-found: error

@@ -1,0 +1,25 @@
+# Normalize line endings to LF in the repository (Linux CI correctness).
+# Windows checkouts get LF too; editors handle it. Critical for bash scripts / yml.
+* text=auto eol=lf
+
+# Explicit LF for source/script files
+*.sh   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf
+*.py   text eol=lf
+*.c    text eol=lf
+*.cpp  text eol=lf
+*.h    text eol=lf
+
+# Keep these as-is (no normalization needed, but explicit LF)
+.gitkeep text eol=lf
+
+# Binary artifacts (never text-normalize)
+*.gguf binary
+*.png  binary
+*.jpg  binary
+*.pdf  binary
+*.zip  binary
