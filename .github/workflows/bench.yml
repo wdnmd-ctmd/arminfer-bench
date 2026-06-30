@@ -14,7 +14,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  # contents: write so the job can commit results/*.json back to main (durable baseline record, NF1).
+  contents: write
 
 # Cancel superseded in-flight runs on the same ref (T1.3).
 concurrency:
@@ -283,3 +284,19 @@ jobs:
             bench_raw.json
             time_stderr.txt
           if-no-files-found: error
+
+      - name: Commit baseline JSON to repo (durable record, NF1)
+        if: success()
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add results/*.json
+          if git diff --cached --quiet; then
+            echo "no new result JSON to commit"
+          else
+            git commit -m "T1 baseline: naive Q4_K_M results JSON (auto from CI run #${{ github.run_id }})"
+            git pull --rebase origin "$GITHUB_REF_NAME" || true
+            git push origin "HEAD:$GITHUB_REF_NAME"
+            echo "committed baseline JSON:"
+            git show --stat HEAD
+          fi
