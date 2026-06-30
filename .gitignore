@@ -1,0 +1,19 @@
+# llama.cpp 源码与构建产物(运行时浅拉)
+third_party/llama.cpp/
+third_party/llama.cpp/build/
+
+# ccache
+.ccache/
+*.ccache
+
+# 临时构建产物
+build/
+*.o
+*.obj
+
+# Trae 本地元数据
+.trae/
+
+# 日志/临时
+*.log
+tmp/
