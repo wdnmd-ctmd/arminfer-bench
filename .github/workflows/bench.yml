@@ -199,16 +199,22 @@ jobs:
                   if n in r and r[n] not in (None, ""):
                       return r[n]
               return None
+          # b9728 llama-bench JSON: each row is ONE test (pp OR tg), throughput in
+          # avg_ts/stddev_ts. pp test: n_prompt>0,n_gen=0 ; tg test: n_prompt=0,n_gen>0.
           prefill_avg = prefill_sd = decode_avg = decode_sd = None
           for r in rows:
-              pa = getf(r, 'pp_avg', 'prompt_avg', 'pp')
-              ta = getf(r, 'tg_avg', 'gen_avg', 'tg')
-              if pa and prefill_avg is None:
-                  prefill_avg = float(pa); prefill_sd = float(getf(r,'pp_stddev','pp_stddev') or 0)
-              if ta and decode_avg is None:
-                  decode_avg = float(ta); decode_sd = float(getf(r,'tg_stddev','tg_stddev') or 0)
+              avg_ts = r.get('avg_ts')
+              stddev_ts = r.get('stddev_ts')
+              n_p = r.get('n_prompt', 0) or 0
+              n_g = r.get('n_gen', 0) or 0
+              if avg_ts is None:
+                  continue
+              if n_p > 0 and prefill_avg is None:
+                  prefill_avg = float(avg_ts); prefill_sd = float(stddev_ts or 0)
+              elif n_g > 0 and decode_avg is None:
+                  decode_avg = float(avg_ts); decode_sd = float(stddev_ts or 0)
           if prefill_avg is None or decode_avg is None:
-              print("::error::could not parse pp_avg/tg_avg from llama-bench JSON")
+              print("::error::could not parse avg_ts (prefill/decode) from llama-bench JSON")
               print("raw rows:", rows); sys.exit(1)
 
           # --- peak memory from /usr/bin/time -v ---
