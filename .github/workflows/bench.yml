@@ -259,11 +259,35 @@ jobs:
                   # Runtime probes from verbose stderr (G1: prefer real runtime evidence).
                   repack_msgs = re.findall(r'repack tensor', stderr_txt, re.I)
                   kleidiai_lines = [l for l in stderr_txt.splitlines() if re.search(r'kleidiai', l, re.I)]
-                  kleidiai_runtime_kernel = any(re.search(r'(kernel|buffer|select|primary|registered|init)', l, re.I) for l in kleidiai_lines)
-                  # tensors_offloaded: try parse a count from kleidiai buffer allocation lines.
-                  offloaded = -1
-                  om = re.search(r'kleidiai[^\n]*?(\d+)\s*tensor', stderr_txt, re.I)
-                  if om: offloaded = int(om.group(1))
+
+                  # kleidiai_active (G1 fix — no circular reasoning, no hard assertion on noise):
+                  # Source inspection of kleidiai.cpp @ fabde3b shows:
+                  #   - init prints "kleidiai: primary q4/q8 kernel feature ..." (line 273/279) based
+                  #     on CPU features ONLY — printed for ALL quants when KleidiAI is compiled,
+                  #     NOT a per-model takeover signal (this was the Q4_K_M false-positive root cause).
+                  #   - kleidiai_get_block_args (line 343-352) returns {0,0,0} for non-Q4_0/Q8_0 ->
+                  #     op dispatch fn is never called for Q4_K_M -> no runtime takeover.
+                  #   - op dispatch succeeds silently (only line 859 WARNs on runtime_count==0 failure).
+                  # => "primary kernel" log alone is NOT takeover proof (init noise on Q4_K_M too).
+                  # Real takeover = compiled AND quant in KleidiAI coverage (Q4_0/Q8_0) AND primary
+                  # kernel selected. Behavior cross-validated by the consistency assert below.
+                  kleidiai_primary_kernel = any(re.search(r'kleidiai:\s*primary\s+(q4|q8)\s+kernel', l, re.I) for l in kleidiai_lines)
+                  kleidiai_no_compatible  = any(re.search(r'kleidiai:\s*no compatible\s+(q4|q8)\s+kernels', l, re.I) for l in kleidiai_lines)
+                  kleidiai_supported_quant = Q in ("q4_0", "q8_0")
+
+                  if not kleidiai_compiled:
+                      kleidiai_active = False; kleidiai_active_source = "no_kleidiai_in_build"
+                  elif not kleidiai_supported_quant:
+                      # Q4_K_M etc: kleidiai_get_block_args returns {0,0,0}, op never called -> no-op
+                      # (source-code coverage fact, NOT behavior-inferred — satisfies G1).
+                      kleidiai_active = False; kleidiai_active_source = "no_runtime_takeover_kquant_noop"
+                  elif kleidiai_no_compatible:
+                      kleidiai_active = False; kleidiai_active_source = "no_compatible_kernel_for_cpu"
+                  elif kleidiai_primary_kernel:
+                      # Q4_0/Q8_0 + select succeeded -> candidate active; behavior cross-checked below.
+                      kleidiai_active = True; kleidiai_active_source = "verbose_log_primary_kernel"
+                  else:
+                      kleidiai_active = False; kleidiai_active_source = "inconclusive_no_primary_kernel_log"
 
                   # repack_active: runtime log wins; cmake_inferred ONLY last-resort fallback (G1).
                   if repack_msgs:
@@ -273,21 +297,12 @@ jobs:
                   else:
                       repack_active = False; repack_active_source = "cmake_off"
 
-                  # kleidiai_active: runtime log wins; compiled_inferred ONLY last-resort (G1).
-                  if kleidiai_lines and kleidiai_runtime_kernel:
-                      kleidiai_active = True; kleidiai_active_source = "verbose_log"
-                  elif not kleidiai_lines:
-                      if kleidiai_compiled and Q in ("q4_0","q8_0"):
-                          kleidiai_active = False; kleidiai_active_source = "inconclusive_no_runtime_msg"
-                      elif not kleidiai_compiled:
-                          kleidiai_active = False; kleidiai_active_source = "no_kleidiai_in_build"
-                      else:
-                          kleidiai_active = False; kleidiai_active_source = "kquant_noop_expected"
-                  else:
-                      kleidiai_active = False; kleidiai_active_source = "inconclusive_lines_present"
-
-                  if offloaded < 0:
-                      offloaded = 0 if not kleidiai_active else -1
+                  # offloaded (G1 fix): b9728 KleidiAI op dispatch succeeds silently — no per-tensor
+                  # count in the log (kleidiai.cpp only WARNs at line 859 on failure; slot_count/count
+                  # are kernel-slot counts, not offloaded-tensor counts). No reliable count can be
+                  # parsed -> honest null + source, never fake -1 (which reads like an error).
+                  offloaded = None
+                  offloaded_source = "unavailable_in_build_log"
 
                   model_size_mb = round(pathlib.Path('models', gguf_file[Q]).stat().st_size/(1024*1024), 2)
                   ttft_ms = round(pp_n/prefill_avg*1000.0, 3)
@@ -311,6 +326,7 @@ jobs:
                       "kleidiai_compiled": kleidiai_compiled,
                       "kleidiai_active": kleidiai_active,
                       "kleidiai_tensors_offloaded": offloaded,
+                      "kleidiai_tensors_offloaded_source": offloaded_source,
                       "repack_active": repack_active,
                       # Probe sources (G1: verbose_log=real runtime evidence; *_inferred=last-resort
                       # fallback NEVER alone sufficient for active; inconclusive_* = no hard assertion).
@@ -324,7 +340,30 @@ jobs:
                   out.write_text(json.dumps(result, ensure_ascii=False, indent=2)+"\n", encoding='utf-8')
                   records[(V,Q)] = result
                   print(f"=== {tag} ===")
-                  print(json.dumps({k:result[k] for k in ('variant','quant','prefill_tok_s','decode_tok_s','ttft_ms','peak_mem_mb','kleidiai_compiled','kleidiai_active','kleidiai_tensors_offloaded','repack_active','kleidiai_active_source','repack_active_source')}, ensure_ascii=False, indent=2))
+                  print(json.dumps({k:result[k] for k in ('variant','quant','prefill_tok_s','decode_tok_s','ttft_ms','peak_mem_mb','kleidiai_compiled','kleidiai_active','kleidiai_tensors_offloaded','kleidiai_tensors_offloaded_source','repack_active','kleidiai_active_source','repack_active_source')}, ensure_ascii=False, indent=2))
+
+          # ===== G1 consistency assertion: probe MUST agree with behavior (no circular reasoning) =====
+          # active=True but kleidiai_only speedup ≈ 1 (within noise) -> probe contradicts no-op
+          # behavior -> FAIL the build. Conversely active=False on Q4_0 but speedup >> 1 -> probe
+          # missed a real takeover -> FAIL. This keeps probe and behavior permanently in sync.
+          for Q in quants:
+              k = records.get(("kleidiai_only", Q)); n = records.get(("norepack", Q))
+              if not (k and n and n['prefill_tok_s'] > 0):
+                  continue
+              pp_ratio = k['prefill_tok_s'] / n['prefill_tok_s']
+              tg_ratio = k['decode_tok_s']  / n['decode_tok_s']
+              if k['kleidiai_active']:
+                  # active=True expects real takeover -> speedup significantly > 1 (>5%).
+                  if abs(pp_ratio - 1.0) < 0.05 and abs(tg_ratio - 1.0) < 0.05:
+                      print(f"::error::G1 CONSISTENCY FAIL: kleidiai_only-{Q} kleidiai_active=True but speedup~=1 (pp={pp_ratio:.3f}, tg={tg_ratio:.3f}) -- probe contradicts no-op behavior")
+                      sys.exit(1)
+              else:
+                  # active=False on a KleidiAI-covered quant (Q4_0/Q8_0) expects no-op (speedup~=1);
+                  # if speedup >> 1 there -> probe missed a real takeover -> FAIL.
+                  if Q in ("q4_0", "q8_0") and (pp_ratio > 1.10 or tg_ratio > 1.10):
+                      print(f"::error::G1 CONSISTENCY FAIL: kleidiai_only-{Q} kleidiai_active=False but speedup>>1 (pp={pp_ratio:.3f}, tg={tg_ratio:.3f}) -- behavior shows real takeover probe missed")
+                      sys.exit(1)
+          print("=== G1 consistency check PASSED: probe agrees with behavior on all quants ===")
 
           # ===== Generate 2 comparison tables (one per quant) + G1 behavior cross-check =====
           def speedup(a, b): return round(a/b, 3) if b else None
@@ -344,7 +383,8 @@ jobs:
                   tr = speedup(r['ttft_ms'], naive['ttft_ms'])
                   mr = speedup(r['peak_mem_mb'], naive['peak_mem_mb'])
                   src = f"k:{r['kleidiai_active_source']}; r:{r['repack_active_source']}"
-                  lines.append(f"| {V} | {r['prefill_tok_s']:.3f} | {r['decode_tok_s']:.3f} | {r['ttft_ms']:.1f} | {r['peak_mem_mb']:.1f} | {r['kleidiai_compiled']} | {r['kleidiai_active']} | {r['kleidiai_tensors_offloaded']} | {r['repack_active']} | {ps} | {ds} | {tr} | {mr} | {src} |")
+                  off_disp = 'null' if r['kleidiai_tensors_offloaded'] is None else r['kleidiai_tensors_offloaded']
+                  lines.append(f"| {V} | {r['prefill_tok_s']:.3f} | {r['decode_tok_s']:.3f} | {r['ttft_ms']:.1f} | {r['peak_mem_mb']:.1f} | {r['kleidiai_compiled']} | {r['kleidiai_active']} | {off_disp} | {r['repack_active']} | {ps} | {ds} | {tr} | {mr} | {src} |")
               # G1 behavior cross-check (kleidiai_only vs norepack).
               npp = records[("norepack",Q)]['prefill_tok_s']
               kpp = records[("kleidiai_only",Q)]['prefill_tok_s']
@@ -367,21 +407,21 @@ jobs:
               lines.append("")
               if Q == "q4_k_m":
                   lines.append("## KleidiAI k-quant no-op gotcha")
-                  lines.append("- KleidiAI 微内核仅覆盖 Q4_0/Q8_0,对 Q4_K_M 完全 no-op(select_kernels 返回 nullptr)。")
-                  lines.append("- 本表 kleidiai_only/kleidiai 两档 kleidiai_active 应为 false、offloaded=0;speedup 应≈ norepack(噪声内)。")
+                  lines.append("- KleidiAI 微内核仅覆盖 Q4_0/Q8_0,对 Q4_K_M 完全 no-op(kleidiai_get_block_args 返回 {0,0,0},op 不被调用)。")
+                  lines.append("- 本表 kleidiai_only/kleidiai 两档 kleidiai_active 应为 false(source=no_runtime_takeover_kquant_noop)、offloaded=null(b9728 op 静默无张量计数日志);speedup 应≈ norepack(噪声内)。G1 一致性断言已交叉验证 active 与行为一致。")
                   lines.append("")
               if Q == "q4_0":
                   lines.append("## G2 Q4_0 双优化叠加交互")
                   lines.append("- kleidiai 档(repack+KleidiAI 都 ON)在 Q4_0 上两者可能竞争同一批张量。")
-                  lines.append("- 探针记录实际接管:见 kleidiai_active / repack_active / offloaded。")
-                  lines.append("- 若 kleidiai 档 offloaded=0 而 repack_active=true → repack 抢先接管 Q4_0→Q4_X_X,KleidiAI 被旁路,收益归 repack 不归 KleidiAI。")
+                  lines.append("- b9728 KleidiAI op 静默无张量计数日志 -> offloaded=null(source=unavailable_in_build_log),无法用 offloaded 判定接管者。")
+                  lines.append("- 行为判定:kleidiai 档 speedup ~= kleidiai_only ~= repack(三者持平)-> 无叠加收益,实际只一个路径接管,不可把 repack 收益重复记到 KleidiAI 头上。")
                   lines.append("")
               pathlib.Path(f"results/{ts}-comparison-{Q}.md").write_text("\n".join(lines)+"\n", encoding='utf-8')
               print(f"=== comparison table {Q} written ===")
 
           print("=== ALL 10 RESULTS SUMMARY ===")
           for (V,Q),r in records.items():
-              print(f"{V:16s} {Q:8s} pp={r['prefill_tok_s']:.3f} tg={r['decode_tok_s']:.3f} ttft={r['ttft_ms']:.1f} mem={r['peak_mem_mb']:.1f} k_comp={r['kleidiai_compiled']} k_act={r['kleidiai_active']} off={r['kleidiai_tensors_offloaded']} r_act={r['repack_active']}")
+              print(f"{V:16s} {Q:8s} pp={r['prefill_tok_s']:.3f} tg={r['decode_tok_s']:.3f} ttft={r['ttft_ms']:.1f} mem={r['peak_mem_mb']:.1f} k_comp={r['kleidiai_compiled']} k_act={r['kleidiai_active']} k_src={r['kleidiai_active_source']} off={r['kleidiai_tensors_offloaded']} r_act={r['repack_active']}")
           PYEOF
 
       - name: Upload artifacts (full audit trail — 全程 AI 参赛佐证)
@@ -402,6 +442,9 @@ jobs:
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Purge previous-round T2 matrix files, keep T1 baseline (20260630T162334Z-*) + .gitkeep.
+          # Eliminates stale probe JSON so downstream T4 dashboard never reads superseded data.
+          git ls-files 'results/*-q4_*.json' 'results/*-comparison-*.md' | grep -v '^results/20260630T162334Z-' | xargs -r git rm -f --ignore-unmatch
           git add results/*.json results/*-comparison-*.md
           if git diff --cached --quiet; then
             echo "no new result files to commit"
