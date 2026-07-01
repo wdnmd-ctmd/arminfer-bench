@@ -71,6 +71,12 @@ echo "build_dir : $BUILD_DIR"
 # GGML_LOG_LEVEL=DEBUG so runtime -v logs surface repack/kleidiai DEBUG messages (G1).
 # (Option may not exist on all commits; pass through, cmake ignores unknown -D only if
 #  marked as such — guard with a feature probe is overkill; we set env instead at bench.)
+
+# Pre-create build dir so `tee "$BUILD_DIR/cmake_config.log"` in the pipeline below
+# doesn't race with cmake -B (which creates the dir). Without this, tee can fail with
+# "No such file or directory" before cmake creates the dir, and pipefail propagates exit 1.
+mkdir -p "$BUILD_DIR"
+
 cmake -S "$SRC_DIR" -B "$BUILD_DIR" \
     -DGGML_NATIVE=OFF \
     -DGGML_CPU_ARM_ARCH="$ARCH" \
