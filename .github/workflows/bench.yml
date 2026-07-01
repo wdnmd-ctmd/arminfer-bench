@@ -1,4 +1,4 @@
-name: Arm64 Bench (T3: 3-quant matrix + perplexity + PMU probe)
+name: "Arm64 Bench (T3: 3-quant matrix + perplexity + PMU probe)"
 
 # W3 = T3. Source of truth: .trae/specs/bootstrap-arm-infer-bench/spec.md
 # 五档 × 三量化(Q4_K_M/Q4_0/Q8_0) = 15 速度基准 + perplexity 质量列 + PMU 探针。
@@ -96,7 +96,7 @@ jobs:
           echo "runner_os=${RUNNER_OS}" >> "$GITHUB_OUTPUT"
           { echo "=== compiler ==="; cc --version | head -1; echo "=== runner os ==="; cat /etc/os-release; } | sed 's/^/  /'
 
-      - name: Install ccache + binutils + unzip + perf (T3: unzip for wikitext, perf for PMU probe)
+      - name: "Install ccache + binutils + unzip + perf (T3: unzip for wikitext, perf for PMU probe)"
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ccache binutils unzip
